@@ -20,8 +20,9 @@ for t in tests:
     except asm3210.AsmError as e:
         print(f'{t}: ASM ERROR {e}'); fail += 1; continue
     os.makedirs('obj', exist_ok=True)
-    open(f'obj/{t}.bin', 'wb').write(asm3210.image(out, 0))
-    cmd = ['./obj/Vtb_dsp', f'obj/{t}.bin'] + args.split() + os.environ.get('DSPARGS', '').split()
+    image_path = f'obj/{os.path.basename(t)}.bin'
+    open(image_path, 'wb').write(asm3210.image(out, 0))
+    cmd = [os.environ.get('DSPBIN', './obj/Vtb_dsp'), image_path] + args.split() + os.environ.get('DSPARGS', '').split()
     for a, _ in exp:
         cmd += ['--dump', hex(a), '4']
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -35,8 +36,10 @@ for t in tests:
         fail += 1
         print(f'{t}: FAIL' + ('' if done else ' (no halt)' if halt else ' (no done mark)'))
         for l in r.stdout.split('\n'):
-            if l.startswith('FAIL') or l.startswith('[dsp] end') or l.startswith('[dsp] halted'):
+            if l.startswith('FAIL') or l.startswith('[dsp] end') or l.startswith('[dsp] halted') or '%Fatal:' in l or '%Error:' in l:
                 print('   ' + l)
+        if r.returncode != 0 and r.stderr.strip():
+            print('   ' + r.stderr.strip())
         for a, v, g in bad:
             print(f'   {a:08X}: {g if g is None else f"{g:08X}"} want {v:08X}')
     else:

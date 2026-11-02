@@ -25,6 +25,9 @@ int main(int argc, char **argv)
 	std::vector<std::pair<uint32_t, uint32_t>> dumps;
 	long irq0 = -1, irq1 = -1;
 	bool cmode = false;
+	long expect_blocks = -1;
+	bool irq_block = false;
+	long block_irq_clock = -1;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i];
 		if (a == "--cycles") cycles = atol(argv[++i]);
@@ -33,6 +36,8 @@ int main(int argc, char **argv)
 		else if (a == "--irq0") irq0 = atol(argv[++i]);
 		else if (a == "--irq1") irq1 = atol(argv[++i]);
 		else if (a == "--cmode") cmode = true;
+		else if (a == "--blocks") expect_blocks = atol(argv[++i]);
+		else if (a == "--irq-block") irq_block = true;
 		else img = argv[i];
 	}
 	if (!img) { fprintf(stderr, "usage: %s IMAGE [options]\n", argv[0]); return 2; }
@@ -56,7 +61,9 @@ int main(int argc, char **argv)
 		tick();
 		if (top->retire) retired++;
 		long ic = t / 4;
-		top->ir0_n = !(irq0 >= 0 && ic >= irq0 && ic < irq0 + 4);
+		if (irq_block && block_irq_clock < 0 && r->tb_dsp__DOT__block_groups != 0) block_irq_clock = t;
+		top->ir0_n = !((irq0 >= 0 && ic >= irq0 && ic < irq0 + 4) ||
+		                 (block_irq_clock >= 0 && t < block_irq_clock + 8));
 		top->ir1_n = !(irq1 >= 0 && ic >= irq1 && ic < irq1 + 4);
 		if (r->tb_dsp__DOT__mem[0xFFFF0 >> 2] == 0x600DD0E5u) break;
 		if (top->halted) { printf("[dsp] halted (double error) at %ld\n", t); break; }
@@ -67,6 +74,12 @@ int main(int argc, char **argv)
 	for (auto &d : dumps)
 		for (uint32_t a = d.first; a < d.first + d.second; a += 4)
 			printf("%08X %08X\n", a, r->tb_dsp__DOT__mem[(a & 0xFFFFF) >> 2]);
+	if (expect_blocks >= 0 && (r->tb_dsp__DOT__block_groups != expect_blocks ||
+	    r->tb_dsp__DOT__block_words != 4 * expect_blocks)) {
+		printf("FAIL: block groups %u words %u, expected %ld groups\n",
+		       r->tb_dsp__DOT__block_groups, r->tb_dsp__DOT__block_words, expect_blocks);
+		delete top; return 1;
+	}
 	delete top;
 	return 0;
 }
