@@ -1,0 +1,4 @@
+tb/obj*/
+tb/build.log
+tb/run*.log
+tb/__pycache__/
