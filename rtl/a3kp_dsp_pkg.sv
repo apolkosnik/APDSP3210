@@ -150,8 +150,9 @@ function automatic dfp_t normalize(input logic signed [40:0] s, input logic sign
 		fl.z = 1'b1;
 		return DFP_ZERO;
 	end
-	// the highest bit that differs from the sign
-	pos = 0;
+	// the highest bit that differs from the sign (all ones, -1 in the last
+	// place, has none: it is -2 one place lower)
+	pos = (s == -41'sd1) ? -1 : 0;
 	for (int i = 0; i < 40; i++)
 		if (s[i] != s[40]) pos = i;
 	// the implicit bit belongs at bit 32

@@ -28,7 +28,7 @@ task automatic f2i_args(input [3:0] g, input [39:0] ya, input [7:0] dc,
 	if (g == 4'd1) begin
 		if (dc[3]) tbits = 6'd9;                             // (9 bits signed: 0..255 after the clamp)
 		else begin
-			if (x.e != 8'd0) tx.e = x.e + 1'd1;
+			if (x.e != 8'd0 && x.e != 8'd255) tx.e = x.e + 1'd1;   // (exponent 255 + 1 would wrap to zero; 2^127 saturates all the same)
 			trnd  = 2'b11;
 			tbits = 6'd18;
 		end
@@ -60,7 +60,7 @@ function automatic logic signed [32:0] dfp_to_int(input dfp_t x, input [1:0] rnd
 	minv = -(64'sd1 <<< (bits - 6'd1));
 	if (sh > $signed({26'd0, bits})) return (m < 0) ? 33'(minv) : 33'(maxv);
 	if (sh >= 31) q = m <<< (sh - 31);
-	else if (sh < -33) q = (m < 0) ? -64'sd1 : 64'sd0;
+	else if (sh < -33) q = (m < 0 && rnd == 2'b01) ? -64'sd1 : 64'sd0;   // |x| < 2^-33: -1 only toward -inf
 	else begin
 		logic signed [63:0] t;
 		logic               fr;

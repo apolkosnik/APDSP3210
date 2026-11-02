@@ -29,23 +29,25 @@
 //  MMIO registers on chip; external memory through the bus port (the DSP
 //  master of a3kp_lbarb).  pcw[10] selects the map (3.4): Computer mode puts
 //  the on-chip resources at 0x00000000-0x0000FFFF, Processor mode at
-//  0x50030000-0x5003FFFF.  Big-endian byte order only (pcw[8] = 1, as the
-//  AA3000 straps it).
+//  0x50030000-0x5003FFFF. ENABLE_LITTLE_ENDIAN enables pcw[8]'s lane
+//  selection; the default retains the AA3000's big-endian-only interface.
 //
 //  Exceptions (7.5): interrupts by the continuation model -- the shadow
 //  registers (pcsh, the instruction shadow, a0-a3, dauc, ps, ctr, the DO
 //  loop), "goto evtp+8N; nop" -- and ireturn; errors by the abort model --
 //  "call evtp+8N (r20); nop" -- with the error levels, sftrst and the double
 //  error (the processor stops, IACK0 and IACK1 both up); reset as vector 0.
-//  waiti, do and dolock (doblock runs as do: the AA3000's logic never answers
-//  a burst, and software must not use it).
-//
-//  Not here yet: the serial I/O's shifting and its DMA (the MMIO registers
-//  are), the timer's BIO1 output.
+//  waiti, do, dolock, and optional doblock quad-word indicators.
+//  Serial I/O (a3kp_dsp_sio), cycle-stealing DMA, and the timer's BIO0
+//  sources and BIO1 pulse/toggle output implement manual sections 9.1-9.3.
 //============================================================================
 
 module a3kp_dsp3210
 import a3kp_dsp_pkg::*;
+#(
+	parameter bit ENABLE_LITTLE_ENDIAN = 1'b0,
+	parameter bit ENABLE_DOBLOCK = 1'b0
+)
 (
 	input             clk,
 	input             ce,             // CKI: one state
@@ -61,6 +63,11 @@ import a3kp_dsp_pkg::*;
 	input      [31:0] m_rdata,
 	input             m_berr,
 	output            m_hold,         // the DSP wants the bus between its accesses
+	output reg        m_block = 1'b0, // this access is part of a doblock quad-word
+	output reg        m_block_first = 1'b0,
+	output            m_lock,         // retain ownership through a locked sequence
+	input             m_grant = 1'b1, // optional ownership indication for DMA IRB/ORB
+	output            m_dma_request,
 
 	// interrupts
 	input             ir0_n,
@@ -72,6 +79,11 @@ import a3kp_dsp_pkg::*;
 	input       [7:0] bio_in,
 	output      [7:0] bio_out,
 	output      [7:0] bio_oe,
+
+	// Serial I/O. Tie unused clock/load/sync inputs high and DI low.
+	input             sio_di, sio_ick_in, sio_ild_in, sio_ock_in, sio_old_in, sio_sy_in,
+	output            sio_do, sio_ick_out, sio_ild_out, sio_ock_out, sio_old_out, sio_sy_out,
+	output            sio_ick_oe, sio_ild_oe, sio_ock_oe, sio_old_oe, sio_sy_oe,
 
 	// observation
 	output     [31:0] dbg_pc,
@@ -105,20 +117,46 @@ reg  [7:0] tcon = 8'd0;
 reg [31:0] tcount = 32'hFFFFFFFF;
 reg [31:0] tinit = 32'hFFFFFFFF;
 reg  [1:0] tpre = 2'd0;
+reg        tbio0 = 1'b0, tpulse = 1'b0, ttoggle = 1'b0;
 reg  [7:0] bioc = 8'd0;
 reg  [7:0] bio_q = 8'd0;
 reg [31:0] ioc = 32'd0, idp = 32'd0, odp = 32'd0, ibuf = 32'd0, obuf = 32'd0;
 reg [15:0] icnt = 16'd0, ocnt = 16'd0;
 reg  [7:0] dmacr = 8'd0;
 reg        ibf = 1'b0, obe = 1'b1;
+reg [31:0] next_idp = 32'd0, next_odp = 32'd0;
+reg [15:0] next_icnt = 16'd0, next_ocnt = 16'd0;
+reg [15:0] ioffset = 16'd0, ooffset = 16'd0;
+reg ifrm_p = 1'b0, ofrm_p = 1'b0;
+reg [2:0] dma_state = 3'd0;
+reg [1:0] dma_ticks = 2'd0;
+reg dma_pair_output = 1'b0;
+reg dma_input;
+reg [1:0] dma_size, dma_type;
+reg [31:0] dma_addr, dma_data, dma_q;
+wire dma_active = dma_state != 3'd0;
+wire sio_rx_valid, sio_tx_take, sio_sy, sio_fb;
+wire [31:0] sio_rx_data;
+a3kp_dsp_sio serial_port (
+	.clk(clk), .ce(ce), .reset(reset), .ioc(ioc), .obuf(obuf), .obe(obe),
+	.di(sio_di), .ick_in(sio_ick_in), .ild_in(sio_ild_in), .ock_in(sio_ock_in),
+	.old_in(sio_old_in), .sy_in(sio_sy_in), .dout(sio_do),
+	.ick_out(sio_ick_out), .ild_out(sio_ild_out), .ock_out(sio_ock_out),
+	.old_out(sio_old_out), .sy_out(sio_sy_out),
+	.ick_oe(sio_ick_oe), .ild_oe(sio_ild_oe), .ock_oe(sio_ock_oe),
+	.old_oe(sio_old_oe), .sy_oe(sio_sy_oe),
+	.rx_valid(sio_rx_valid), .rx_data(sio_rx_data), .tx_take(sio_tx_take), .sy(sio_sy), .fb(sio_fb)
+);
 
-assign bio_out = bio_q;
+wire timer_out = tcon[2] ? ttoggle : (tpulse ^ !tcon[3]);
+assign bio_out = {bio_q[7:2], tcon[4] ? timer_out : bio_q[1], bio_q[0]};
 assign bio_oe  = bioc;
 
 wire cmode = pcw[10];
+wire big_endian = !ENABLE_LITTLE_ENDIAN || pcw[8];
 
 // ps (Table 10-4): n z v c N Z U V ibf obe sy fb ir0 ir1
-wire [15:0] ps = {2'b00, ir1_n, ir0_n, 1'b0, 1'b0, obe, ibf,
+wire [15:0] ps = {2'b00, ir1_n, ir0_n, sio_fb, sio_sy, obe, ibf,
                   dfl.v, dfl.u, dfl.z, dfl.n, cfl[0], cfl[1], cfl[2], cfl[3]};
 
 //----------------------------------------------------------------------------
@@ -135,11 +173,13 @@ function automatic [1:0] mtype(input [31:0] a, input cm);
 	return MT_MMIO;                                 // 0x0400-0x07FF (the reserved space reads 0)
 endfunction
 
-// big-endian lanes: byte enables and lane data of an access
+// Byte enables follow the configured byte order; word values are unchanged.
 function automatic [3:0] be_of(input [1:0] sz, input [1:0] a);
+	logic [1:0] lane;
+	lane = big_endian ? a : ~a;
 	case (sz)
-		2'd0:    be_of = 4'b1000 >> a;
-		2'd1:    be_of = a[1] ? 4'b0011 : 4'b1100;
+		2'd0:    be_of = 4'b1000 >> lane;
+		2'd1:    be_of = lane[1] ? 4'b0011 : 4'b1100;
 		default: be_of = 4'b1111;
 	endcase
 endfunction
@@ -160,6 +200,8 @@ reg        d_v = 1'b0;
 reg [31:0] d_ir;
 reg [31:0] d_pc;
 reg        d_waiti_hold = 1'b0;     // D holds the instruction after waiti
+reg d_block = 1'b0, o_block = 1'b0;
+reg [10:0] d_remaining, o_remaining;
 
 // O
 localparam [2:0] O_NONE = 3'd0, O_DA = 3'd1, O_LD = 3'd2, O_ST = 3'd3, O_LDIO = 3'd4;
@@ -184,6 +226,7 @@ typedef struct packed {
 	logic        zw;            // a Z write
 	logic        ni;            // the exception's injected nop
 	logic  [6:0] dc;            // dauc as the instruction left O (a dauc write affects the following instructions)
+	logic block_move;
 } dau_t;
 dau_t m_s = '0, a_s = '0;
 dprod_t m_p;                         // the M stage's product, into A
@@ -193,6 +236,7 @@ reg        w_v = 1'b0;
 reg [31:0] w_a;
 reg [31:0] w_d;
 reg  [1:0] w_sz;
+reg w_block = 1'b0;
 
 //----------------------------------------------------------------------------
 // exceptions, interrupts, loops
@@ -207,6 +251,8 @@ reg [31:0] inj_pc;
 reg        irsh_v = 1'b0;           // the next D comes from the instruction shadow
 reg [31:0] irsh, irsh_pc;
 reg        irsh_has = 1'b0;         // the shadow holds an instruction (else the return just fetches pcsh)
+reg irsh_block;
+reg [10:0] irsh_remaining;
 reg        noint = 1'b0;            // the instruction just executed locks out an interrupt
 reg        ir0_d = 1'b1, ir1_d = 1'b1;
 reg        ir0_p = 1'b0, ir1_p = 1'b0, tmr_p = 1'b0;
@@ -227,6 +273,14 @@ reg        lp_on = 1'b0;
 reg        lp_lock = 1'b0;          // dolock: no interrupts
 reg [31:0] lp_start, lp_end;
 reg [10:0] lp_cnt;
+reg lp_block = 1'b0, lp_cache = 1'b0;
+reg [31:0] lp_word;
+reg sh_lp_block, sh_lp_cache;
+reg [31:0] sh_lp_word;
+reg quad_lock = 1'b0;
+reg [1:0] quad_left = 2'd0;
+wire cached_fetch = lp_cache && lp_on && fpc == lp_start && st == 2'd2;
+assign m_lock = lp_lock || quad_lock;
 
 assign dbg_halted = halted;
 assign dbg_pc     = d_pc;
@@ -254,7 +308,7 @@ reg [31:0] ram_q;
 wire [31:0] prev_q = (prev_t == MT_RAM) ? ram_q : (prev_t == MT_ROM) ? rom_q :
                      (prev_t == MT_MMIO) ? mmio_q : ext_q;
 
-assign m_hold = !reset && !halted && !waiting && mtype(fpc, cmode) == MT_EXT;
+assign m_hold = !reset && !halted && (m_lock || m_dma_request || dma_active || (!waiting && mtype(fpc, cmode) == MT_EXT));
 
 //----------------------------------------------------------------------------
 // the register file and the DA pointers
@@ -325,8 +379,11 @@ reg  [31:0] z_addr;                 // Z's address (state 2)
 //----------------------------------------------------------------------------
 wire [31:0] dpc8 = d_pc + 32'd8;    // "pc" as an operand: the instruction's address + 8
 
+// (pcsh, 7.5.1: in the interrupt routine the address the return fetches;
+// at the base level the same value as the pc -- the register itself keeps
+// what interrupt entry or a write left)
 function automatic [31:0] dget(input [4:0] c, input [31:0] q);
-	if (c == R_PC) return dpc8;
+	if (c == R_PC || (c == R_PCSH && level == 2'd0)) return dpc8;
 	return rf_rd(c, q);
 endfunction
 
@@ -347,7 +404,7 @@ function automatic logic illegal(input [5:0] op);
 endfunction
 
 function automatic logic cond_true(input [5:0] c, input [3:0] cf, input dflags_t df,
-                                   input i_ibf, input i_obe, input i_ir0, input i_ir1);
+                                   input i_ibf, input i_obe, input i_ir0, input i_ir1, input i_sy, input i_fb);
 	logic n, z, v, cy, r;
 	n = cf[3]; z = cf[2]; v = cf[1]; cy = cf[0];
 	case (c[5:1])
@@ -366,8 +423,8 @@ function automatic logic cond_true(input [5:0] c, input [3:0] cf, input dflags_t
 		5'd12: r = df.n | df.z;
 		5'd16: r = i_ibf;
 		5'd17: r = i_obe;
-		5'd20: r = 1'b0;          // sy
-		5'd21: r = 1'b0;          // fb
+		5'd20: r = i_sy;
+		5'd21: r = i_fb;
 		5'd22: r = i_ir0;
 		5'd23: r = i_ir1;
 		default: r = 1'b0;
@@ -655,7 +712,7 @@ always @(*) begin
 	else if (ir[31:27] == 5'b10000) begin
 		// conditional branch, nop, ireturn, return
 		if (ir == 32'h803E0000) dx.iret = 1'b1;
-		else if (cond_true(ir[26:21], cfl, dfl, ibf, obe, ir0_n, ir1_n)) begin
+		else if (cond_true(ir[26:21], cfl, dfl, ibf, obe, ir0_n, ir1_n, sio_sy, sio_fb)) begin
 			dx.br   = 1'b1;
 			dx.br_t = dp_c + nimm;
 		end
@@ -735,7 +792,7 @@ always @(*) begin
 		rs2 = ir[4:0];
 		// (rS2 as -n / +n of the stack pointer: not interruptible)
 		if ((rs2 == R_MN || rs2 == R_PN) && rd == R_SP && rs1 == R_SP) dx.noint = 1'b1;
-		if (cond_true(ir[10:5], cfl, dfl, ibf, obe, ir0_n, ir1_n)) begin
+		if (cond_true(ir[10:5], cfl, dfl, ibf, obe, ir0_n, ir1_n, sio_sy, sio_fb)) begin
 			res = au_res;
 			dx.fl   = 1'b1;
 			dx.fl_v = (f == 4'd0 || f == 4'd2 || f == 4'd4 || f == 4'd7 || f == 4'd11) ? res[35:32] :
@@ -1039,7 +1096,7 @@ end
 //----------------------------------------------------------------------------
 // interrupts: the highest priority one pending and enabled (Table 7-1)
 //----------------------------------------------------------------------------
-wire [15:0] int_req = {ir1_p, 1'b0 /* OFRM */, 1'b0 /* IFRM */, 1'b0 /* OBE */, 1'b0 /* IBF */, 1'b0,
+wire [15:0] int_req = {ir1_p, ofrm_p, ifrm_p, obe, ibf, 1'b0,
                        tmr_p, ir0_p, 8'd0} & emr;
 reg  [3:0] int_vec;
 always @(*) begin
@@ -1075,7 +1132,7 @@ end
 reg [31:0] fetch_q;                 // the fetched word (state 3's view of the state-2 access)
 reg        fetch_ok;                // a fetch happened this cycle
 
-// MMIO reads (Figure 3-5, big-endian addresses; a register a word)
+// MMIO reads (Figure 3-5; a register a word, lane selection follows PCW)
 function automatic [31:0] mmio_rd(input [9:2] a);
 	case (a)
 		8'h01: mmio_rd = ibuf;                              // 0x404
@@ -1086,7 +1143,7 @@ function automatic [31:0] mmio_rd(input [9:2] a);
 		8'h06: mmio_rd = {24'd0, bioc};                     // 0x41B
 		8'h07: begin                                        // 0x41E: {output register, pin} a bit pair
 			logic [15:0] b;
-			for (int i = 0; i < 8; i++) b[2*i +: 2] = {bio_q[i], bioc[i] ? bio_q[i] : bio_in[i]};
+			for (int i = 0; i < 8; i++) b[2*i +: 2] = {bio_q[i], bioc[i] ? bio_out[i] : bio_in[i]};
 			mmio_rd = {16'd0, b};
 		end
 		8'h08: mmio_rd = idp;
@@ -1102,7 +1159,10 @@ endfunction
 task automatic mmio_wr(input [9:2] a, input [3:0] be, input [31:0] d);
 	case (a)
 		8'h02: begin obuf <= d; obe <= 1'b0; end
-		8'h03: ioc <= d;
+		8'h03: begin
+			for (int b = 0; b < 3; b++) if (be[b]) ioc[8*b +: 8] <= d[8*b +: 8];
+			ioc[31:24] <= 8'd0;
+		end
 		8'h04: if (be[0]) tcon <= d[7:0];
 		8'h05: begin tinit <= d; tcount <= d; end
 		8'h06: if (be[0]) bioc <= d[7:0];
@@ -1116,16 +1176,40 @@ task automatic mmio_wr(input [9:2] a, input [3:0] be, input [31:0] d);
 					default: ;
 				endcase
 		end
-		8'h08: idp <= d;
-		8'h09: odp <= d;
-		8'h0A: icnt <= d[15:0];
-		8'h0B: ocnt <= d[15:0];
+		8'h08: begin
+			for (int b = 0; b < 4; b++) if (be[b]) begin
+				next_idp[8*b +: 8] <= d[8*b +: 8];
+				if (!dmacr[6]) idp[8*b +: 8] <= d[8*b +: 8];
+			end
+			if (!dmacr[6]) ioffset <= 16'd0;
+		end
+		8'h09: begin
+			for (int b = 0; b < 4; b++) if (be[b]) begin
+				next_odp[8*b +: 8] <= d[8*b +: 8];
+				if (!dmacr[2]) odp[8*b +: 8] <= d[8*b +: 8];
+			end
+			if (!dmacr[2]) ooffset <= 16'd0;
+		end
+		8'h0A: begin
+			for (int b = 0; b < 2; b++) if (be[b]) begin
+				next_icnt[8*b +: 8] <= d[8*b +: 8];
+				if (!dmacr[6]) icnt[8*b +: 8] <= d[8*b +: 8];
+			end
+			if (!dmacr[6]) ioffset <= 16'd0;
+		end
+		8'h0B: begin
+			for (int b = 0; b < 2; b++) if (be[b]) begin
+				next_ocnt[8*b +: 8] <= d[8*b +: 8];
+				if (!dmacr[2]) ocnt[8*b +: 8] <= d[8*b +: 8];
+			end
+			if (!dmacr[2]) ooffset <= 16'd0;
+		end
 		8'h0C: if (be[0]) begin
 			// dmac: ICS/OCS gate the input / output settings
-			dmacr[7:6] <= d[7:6];
-			dmacr[3:2] <= d[3:2];
-			if (d[4]) dmacr[5:4] <= d[5:4];
-			if (d[0]) dmacr[1:0] <= d[1:0];
+			dmacr[7] <= d[7];
+			dmacr[3] <= d[3];
+			if (d[4]) dmacr[6:5] <= d[6:5];
+			if (d[0]) dmacr[2:1] <= d[2:1];
 		end
 		default: ;
 	endcase
@@ -1157,6 +1241,9 @@ endtask
 task automatic cycle_end(input [31:0] fw);
 	logic        take_int;
 	logic [31:0] nfpc;
+	logic        n_lp_on, n_lp_lock, n_lp_block, n_lp_cache;
+	logic [31:0] n_lp_word, n_lp_start, n_lp_end;
+	logic [10:0] n_lp_cnt;
 	logic [2:0]  cls;
 	logic [31:0] nd_ir, nd_pc;
 	logic        nd_v;
@@ -1174,6 +1261,7 @@ task automatic cycle_end(input [31:0] fw);
 	w_a  <= a_s.za;
 	w_d  <= a_zd;
 	w_sz <= a_zsz;
+	w_block <= a_s.block_move;
 
 	//------------------------------------------------------------------
 	// M -> A, O -> M
@@ -1194,8 +1282,8 @@ task automatic cycle_end(input [31:0] fw);
 		if (oy_mem) begin
 			logic [1:0] ysz;
 			ysz = y_size(o_ir);
-			yr = (ysz == 2'd0) ? {24'd0, yq[31 - 8*y_lo -: 8]} :
-			     (ysz == 2'd1) ? {16'd0, y_lo[1] ? yq[15:0] : yq[31:16]} : yq;
+			yr = (ysz == 2'd0) ? {24'd0, yq[31 - 8*(big_endian ? y_lo : ~y_lo) -: 8]} :
+			     (ysz == 2'd1) ? {16'd0, (y_lo[1] ^ !big_endian) ? yq[15:0] : yq[31:16]} : yq;
 			yv = w40(yr);
 			ya = 1'b0;
 		end
@@ -1218,6 +1306,7 @@ task automatic cycle_end(input [31:0] fw);
 		m_s.zw   <= oz_mem;
 		m_s.ni   <= o_nopint;
 		m_s.dc   <= dauc[6:0];
+		m_s.block_move <= o_block && o_remaining >= 11'd3;
 	end
 
 	//------------------------------------------------------------------
@@ -1233,11 +1322,11 @@ task automatic cycle_end(input [31:0] fw);
 	if (!take_err && !dbl) begin
 		if (o_k == O_LD) begin
 			logic [31:0] v;
-			v = ld_ext(o_w, xq, o_addr[1:0]);
+			v = ld_ext(o_w, xq, big_endian ? o_addr[1:0] : ~o_addr[1:0]);
 			reg_write(o_reg, v);
 			cfl <= {v[31], v == 32'd0, 2'b00};
 		end
-		if (o_k == O_LDIO) io_write(o_reg, ld_ext(o_w, xq, o_addr[1:0]), wsize(o_w));
+		if (o_k == O_LDIO) io_write(o_reg, ld_ext(o_w, xq, big_endian ? o_addr[1:0] : ~o_addr[1:0]), wsize(o_w));
 		if (dx.pm)  reg_write(dx.pm_c, dx.pm_v);
 		if (dx.wr)  reg_write(dx.wr_c, dx.wr_v);
 		if (dx.fl)  cfl <= dx.fl_v;
@@ -1256,6 +1345,8 @@ task automatic cycle_end(input [31:0] fw);
 	o_reg    <= dx.oreg;
 	o_sd     <= dx.osd;
 	o_nopint <= 1'b0;
+	o_block <= d_block;
+	o_remaining <= d_remaining;
 	if (d_v && !d_waiti_hold) dbg_retire <= 1'b1;
 `ifdef DSP_TRACE
 	if (o_da) $display("[o] %08X x %b y %b yq %08X xq %08X", o_ir, ox_mem, oy_mem, yq, xq);
@@ -1266,26 +1357,35 @@ task automatic cycle_end(input [31:0] fw);
 	//------------------------------------------------------------------
 	// the next fetch address, DO loops
 	//------------------------------------------------------------------
+	// (the loop's state after this cycle, n_*: an interrupt taken now saves
+	// it to the shadow along with pcsh, the fetch after this one)
 	nfpc = fpc;
+	n_lp_on = lp_on; n_lp_lock = lp_lock; n_lp_block = lp_block; n_lp_cache = lp_cache;
+	n_lp_word = lp_word; n_lp_start = lp_start; n_lp_end = lp_end; n_lp_cnt = lp_cnt;
 	if (fetch_ok) begin
 		nfpc = fpc + 32'd4;
 		if (dx.lp) begin
 			// do: the loop begins with the instruction just fetched
-			lp_on    <= 1'b1;
-			lp_lock  <= dx.lp_lk;
-			lp_start <= fpc;
-			lp_end   <= fpc + {23'd0, dx.lp_k, 2'b00};
-			lp_cnt   <= dx.lp_l;
+			n_lp_on    = 1'b1;
+			n_lp_lock  = dx.lp_lk;
+			n_lp_block = ENABLE_DOBLOCK && d_ir[23];
+			n_lp_cache = dx.lp_k == 7'd0;
+			n_lp_word  = fw;
+			n_lp_start = fpc;
+			n_lp_end   = fpc + {23'd0, dx.lp_k, 2'b00};
+			n_lp_cnt   = dx.lp_l;
 			if (dx.lp_k == 7'd0) begin
-				if (dx.lp_l != 11'd0) begin nfpc = fpc; lp_cnt <= dx.lp_l - 1'd1; end
-				else lp_on <= 1'b0;
+				if (dx.lp_l != 11'd0) begin nfpc = fpc; n_lp_cnt = dx.lp_l - 1'd1; end
+				else begin n_lp_on = 1'b0; n_lp_lock = 1'b0; end   // one pass: no loop, no lock
 			end
 		end
 		else if (lp_on && fpc == lp_end) begin
-			if (lp_cnt != 11'd0) begin nfpc = lp_start; lp_cnt <= lp_cnt - 1'd1; end
-			else begin lp_on <= 1'b0; lp_lock <= 1'b0; end
+			if (lp_cnt != 11'd0) begin nfpc = lp_start; n_lp_cnt = lp_cnt - 1'd1; end
+			else begin n_lp_on = 1'b0; n_lp_lock = 1'b0; end
 		end
 	end
+	lp_on <= n_lp_on; lp_lock <= n_lp_lock; lp_block <= n_lp_block; lp_cache <= n_lp_cache;
+	lp_word <= n_lp_word; lp_start <= n_lp_start; lp_end <= n_lp_end; lp_cnt <= n_lp_cnt;
 	if (dx.br) nfpc = dx.br_t;
 
 	//------------------------------------------------------------------
@@ -1315,6 +1415,9 @@ task automatic cycle_end(input [31:0] fw);
 	d_v  <= nd_v;
 	d_ir <= nd_ir;
 	d_pc <= nd_pc;
+	d_block <= fetch_ok && (dx.lp ? (ENABLE_DOBLOCK && d_ir[23]) : (lp_on && lp_block));
+	d_remaining <= dx.lp ? dx.lp_l : lp_cnt;
+	if (irsh_v) begin d_block <= irsh_block; d_remaining <= irsh_remaining; end
 	d_waiti_hold <= 1'b0;
 	if (waiting) d_waiti_hold <= 1'b1;
 
@@ -1347,6 +1450,7 @@ task automatic cycle_end(input [31:0] fw);
 		lp_start <= sh_lp_start;
 		lp_end  <= sh_lp_end;
 		lp_cnt  <= sh_lp_cnt;
+		lp_block <= sh_lp_block; lp_cache <= sh_lp_cache; lp_word <= sh_lp_word;
 		level   <= 2'd0;
 		irsh_v  <= irsh_has;
 		nfpc    = pcsh;
@@ -1374,6 +1478,7 @@ task automatic cycle_end(input [31:0] fw);
 	if (dbl) begin
 		level  <= 2'd3;
 		halted <= 1'b1;
+		quad_lock <= 1'b0;
 	end
 	else if (take_err) begin
 		// abort: the pipeline flushed; call evtp+8N (r20); nop
@@ -1390,15 +1495,18 @@ task automatic cycle_end(input [31:0] fw);
 		err_nm  <= err_nmk;
 		lp_on   <= 1'b0;
 		lp_lock <= 1'b0;
+		quad_lock <= 1'b0; quad_left <= 2'd0;
 		waiting <= 1'b0;
 		d_waiti_hold <= 1'b0;
 		tcon[0] <= 1'b0;
-		dmacr[0] <= 1'b0;
-		dmacr[4] <= 1'b0;
+		dmacr[1] <= 1'b0;
+		dmacr[5] <= 1'b0;
 		pcw[13] <= 1'b0;
 	end
 	else begin
-		take_int = int_any && level == 2'd0 && !lp_lock && !dx.noint && inj == 2'd0 && !irsh_v &&
+		take_int = int_any && level == 2'd0 && !lp_lock &&
+		           (!quad_lock || (pend && m_block && quad_left == 2'd0 && m_ack == m_req)) &&
+		           !dx.noint && inj == 2'd0 && !irsh_v &&
 		           !dx.iret && !dx.waiti && !waiting && !d_waiti_hold;
 		// (leaving waiti, the instruction after it executes first: 7.4)
 		if (take_int) begin
@@ -1408,18 +1516,25 @@ task automatic cycle_end(input [31:0] fw);
 			inj_pc   <= fpc;
 			irsh     <= fw;
 			irsh_pc  <= fpc;
+			irsh_block <= dx.lp ? (ENABLE_DOBLOCK && d_ir[23]) : (lp_on && lp_block);
+			irsh_remaining <= dx.lp ? dx.lp_l : lp_cnt;
 			irsh_has <= fetch_ok && !dx.br;
 			pcsh     <= fetch_ok ? nfpc : fpc;
 			if (!fetch_ok || dx.br) pcsh <= nfpc;
 			d_v      <= 1'b0;
 			level    <= 2'd1;
-			sh_lp_on <= lp_on; sh_lp_lock <= lp_lock; sh_lp_start <= lp_start;
-			sh_lp_end <= lp_end; sh_lp_cnt <= lp_cnt;
+			// (the loop as this cycle leaves it: pcsh is already past this
+			// cycle's fetch, and the shadowed instruction is that fetch)
+			sh_lp_on <= n_lp_on; sh_lp_lock <= n_lp_lock; sh_lp_start <= n_lp_start;
+			sh_lp_end <= n_lp_end; sh_lp_cnt <= n_lp_cnt;
+			sh_lp_block <= n_lp_block; sh_lp_cache <= n_lp_cache; sh_lp_word <= n_lp_word;
 			lp_on    <= 1'b0;
 			shadow_cnt <= 3'd4;
 			case (int_vec)
 				4'd8:  begin ir0_p <= 1'b0; iack_p <= 2'b01; iack_cnt <= 4'd8; end
 				4'd9:  tmr_p <= 1'b0;
+				4'd13: ifrm_p <= 1'b0;
+				4'd14: ofrm_p <= 1'b0;
 				4'd15: begin ir1_p <= 1'b0; iack_p <= 2'b10; iack_cnt <= 4'd8; end
 				default: ;
 			endcase
@@ -1432,6 +1547,17 @@ endtask
 logic        bs_go, bs_we;
 logic  [1:0] bs_sz;
 logic [31:0] bs_ad, bs_wd;
+assign m_dma_request = !reset && ((dmacr[5] && ibf) || (dmacr[1] && obe));
+wire dma_want_input = dmacr[5] && ibf && (!dmacr[7] || m_grant);
+wire dma_want_output = dmacr[1] && obe && (!dmacr[3] || m_grant);
+wire dma_start = !dma_active && !pend && st == 2'd0 && !lp_lock && !quad_lock &&
+                 (dma_want_input || dma_want_output);
+wire [1:0] dma_input_size = ioc[18] && ioc[7:6] == 2'd1 ? 2'd0 :
+                                  ioc[18] && ioc[7:6] == 2'd2 ? 2'd1 : 2'd2;
+wire [1:0] dma_output_size = ioc[19] && ioc[12:10] == 3'd1 ? 2'd0 :
+                                   ioc[19] && ioc[12:10] == 3'd2 ? 2'd1 : 2'd2;
+wire [31:0] dma_input_data = !ioc[16] && dma_input_size == 2'd0 ? {24'd0, ibuf[31:24]} :
+                                !ioc[16] && dma_input_size == 2'd1 ? {16'd0, ibuf[31:16]} : ibuf;
 always @(*) begin
 	bs_go = 1'b0; bs_we = 1'b0; bs_sz = 2'd2; bs_ad = 32'd0; bs_wd = 32'd0;
 	case (st)
@@ -1442,7 +1568,63 @@ always @(*) begin
 		2'd2: if (inj == 2'd0 && !irsh_v && !waiting && !d_waiti_hold) begin bs_go = 1'b1; bs_ad = fpc; end
 		2'd3: if (w_v) begin bs_go = 1'b1; bs_we = 1'b1; bs_ad = w_a; bs_sz = w_sz; bs_wd = w_d; end
 	endcase
+	if (dma_active) begin
+		bs_go = dma_state == 3'd1;
+		bs_we = dma_input;
+		bs_sz = dma_size;
+		bs_ad = dma_addr;
+		bs_wd = dma_data;
+	end
+	if (dma_start) begin
+		bs_go = 1'b1; bs_we = dma_want_input;
+		bs_sz = dma_want_input ? dma_input_size : dma_output_size;
+		bs_ad = dma_want_input ? idp + {16'd0, ioffset} : odp + {16'd0, ooffset};
+		bs_wd = dma_input_data;
+	end
 end
+
+// Outbound writes must leave enough cached iterations to finish all four
+// words before external instruction fetches resume. Pipeline operands still
+// draining after interrupt entry cannot start a new group (lp_on is clear).
+wire quad_begin = ENABLE_DOBLOCK && !quad_lock && bs_ad[3:0] == 4'd0 &&
+                  ((st == 2'd1 && o_block && lp_on && o_remaining >= 11'd3) ||
+                   (st == 2'd3 && w_block && lp_on && lp_cnt >= 11'd3));
+
+// Complete a cycle-stealing DMA access. The CPU's pipeline and pointers are
+// frozen for the access; serial clocks and the timer continue to run.
+task automatic dma_end(input [31:0] data, input fault);
+	logic [15:0] step;
+	step = 16'(inc_of(dma_size));
+	dma_state <= dma_ticks < 2'd2 ? 3'd4 : 3'd0;
+	if (dma_input && dma_pair_output && !fault) begin
+		dma_input <= 1'b0; dma_addr <= odp + {16'd0, ooffset};
+		dma_size <= dma_output_size; dma_state <= 3'd1;
+		dma_pair_output <= 1'b0;
+	end
+	if (fault) begin
+		berr <= 1'b1;
+		if (dma_input) dmacr[5] <= 1'b0; else dmacr[1] <= 1'b0;
+	end
+	else if (dma_input) begin
+		if (ioffset == icnt) begin
+			ifrm_p <= 1'b1; ioffset <= 16'd0;
+			if (dmacr[6]) begin idp <= next_idp; icnt <= next_icnt; end
+			else dmacr[5] <= 1'b0;
+		end
+		else ioffset <= ioffset + step;
+	end
+	else begin
+		obuf <= ld_ext(dma_size == 2'd0 ? 3'd0 : dma_size == 2'd1 ? 3'd2 : 3'd7,
+		               data, big_endian ? dma_addr[1:0] : ~dma_addr[1:0]);
+		obe <= 1'b0;
+		if (ooffset == ocnt) begin
+			ofrm_p <= 1'b1; ooffset <= 16'd0;
+			if (dmacr[2]) begin odp <= next_odp; ocnt <= next_ocnt; end
+			else dmacr[1] <= 1'b0;
+		end
+		else ooffset <= ooffset + step;
+	end
+endtask
 
 //----------------------------------------------------------------------------
 // the A sequence (see A): S0 (a_q 0), S1 (1), then done (2) until the cycle
@@ -1475,6 +1657,7 @@ logic  [1:0] a_q = 2'd0;
 wire         a_done = (a_q == 2'd2);
 wire         st_hold = (st == 2'd3) && !a_done;     // the cycle's last state waits for A
 logic signed [40:0] aw_q;            // S0: the sum, the value to normalize, or the integer's shifted mantissa
+wire                aw_m1 = &aw_q;   // -1 in the last place
 logic signed [9:0]  ae_q;
 logic  [2:0] f_case;                 // the integer: 0 zero, 1 saturated, 2 aw_q, 3 aw_q rounded, 4 below one
 logic        f_neg, f_half, f_fr;
@@ -1508,10 +1691,11 @@ always @(*) begin
 		end
 	end
 	else begin
-		// S1: normalized, the implicit bit to bit 32
+		// S1: normalized, the implicit bit to bit 32 (all ones, -1 in the
+		// last place, has no bit unlike the sign: -2 one place lower)
 		sh_x = aw_q;
-		sh_l = (n_pos <= 6'd32);
-		sh_n = sh_l ? 6'd32 - n_pos : n_pos - 6'd32;
+		sh_l = (n_pos <= 6'd32) || aw_m1;
+		sh_n = aw_m1 ? 6'd33 : sh_l ? 6'd32 - n_pos : n_pos - 6'd32;
 	end
 	sh_y = dsh(sh_x, sh_n, sh_l);
 end
@@ -1524,8 +1708,8 @@ end
 //----------------------------------------------------------------------------
 // the state ends this clock: its on-chip access, or the bus answering (a
 // state that starts an external access ends when it answers)
-wire st_done  = !reset && ce && !halted && !st_hold &&
-                (pend ? m_ack == m_req : !(bs_go && mtype(bs_ad, cmode) == MT_EXT));
+wire st_done  = !reset && ce && !halted && !st_hold && !dma_active && !dma_start &&
+                (pend ? m_ack == m_req : (cached_fetch || !(bs_go && mtype(bs_ad, cmode) == MT_EXT)));
 wire cyc_done = st_done && st == 2'd3 && !take_err && !dbl;
 
 function automatic logic rf_wok(input [4:0] c);
@@ -1543,7 +1727,7 @@ always @(*) begin
 	end
 	else if (st_done && pf_mem) wa_en = 1'b1;
 	else if (cyc_done && o_k == O_LD && rf_wok(o_reg)) begin
-		wa_en = 1'b1; wa_a = o_reg; wa_d = ld_ext(o_w, xq, o_addr[1:0]);
+		wa_en = 1'b1; wa_a = o_reg; wa_d = ld_ext(o_w, xq, big_endian ? o_addr[1:0] : ~o_addr[1:0]);
 	end
 	// (one of the three: a call's link, a result, a pointer post-modified)
 	if (dx.lnk)     begin wb_a = dx.lnk_c; wb_d = d_pc + 32'd8; end
@@ -1624,7 +1808,7 @@ always @(posedge clk) begin
 		// S1: the normalizer -- the result's top two bits differ, then 31
 		// fraction bits (the last truncated), the exponent range checked
 		nf_q <= '{n: 1'b0, z: 1'b0, v: 1'b0, u: 1'b0};
-		en = $signed({ae_q[9], ae_q}) + $signed({5'd0, n_pos}) - 11'sd32;
+		en = $signed({ae_q[9], ae_q}) + $signed({5'd0, n_pos}) - (aw_m1 ? 11'sd33 : 11'sd32);
 		if (aw_q == 41'sd0) begin
 			nr_q   <= DFP_ZERO;
 			nf_q.z <= 1'b1;
@@ -1658,7 +1842,7 @@ always @(posedge clk) begin
 			3'd0:    q = 42'sd0;
 			3'd1:    q = f_neg ? minv : maxv;
 			3'd2:    q = {aw_q[40], aw_q};
-			3'd4:    q = f_neg ? -42'sd1 : 42'sd0;
+			3'd4:    q = (f_neg && a_trnd == 2'b01) ? -42'sd1 : 42'sd0;   // |x| < 2^-33: -1 only toward -inf
 			default: case (a_trnd)
 				2'b01:   q = {aw_q[40], aw_q};
 				2'b11:   q = {aw_q[40], aw_q} + ((f_neg && f_fr) ? 42'sd1 : 42'sd0);
@@ -1675,8 +1859,11 @@ end
 wire [10:0] ram_a  = {bs_ad[12], bs_ad[11:2]};
 wire  [3:0] ram_be = be_of(bs_sz, bs_ad[1:0]);
 wire [31:0] ram_wd = lanes(bs_sz, bs_wd);
-wire        ram_en = !reset && ce && !halted && !st_hold && !pend && bs_go && mtype(bs_ad, cmode) == MT_RAM;
+wire        ram_en = !reset && ce && !halted && !st_hold && !pend && !cached_fetch && bs_go && mtype(bs_ad, cmode) == MT_RAM &&
+                     !((dma_active || dma_start) && ((bs_sz == 2'd2 && bs_ad[1:0] != 0) || (bs_sz == 2'd1 && bs_ad[0])));
 wire        ram_we = ram_en && bs_we;
+wire timer_write = !pend && bs_go && bs_we && !cached_fetch &&
+                   mtype(bs_ad, cmode) == MT_MMIO && bs_ad[9:2] == 8'h05;
 always @(posedge clk) begin
 	if (ram_we) begin
 		if (ram_be[0]) ram[ram_a][0] <= ram_wd[7:0];
@@ -1696,27 +1883,35 @@ always @(posedge clk) begin
 	dbg_retire <= 1'b0;
 
 	if (ce) begin
+		if (sio_rx_valid) begin ibuf <= sio_rx_data; ibf <= 1'b1; end
+		if (sio_tx_take) obe <= 1'b1;
 		ir0_d <= ir0_n;
 		ir1_d <= ir1_n;
 		if (ir0_d && !ir0_n) ir0_p <= 1'b1;
 		if (ir1_d && !ir1_n) ir1_p <= 1'b1;
 		if (iack_cnt != 4'd0) iack_cnt <= iack_cnt - 1'd1;
 		else iack_p <= 2'b00;
-		// the timer: CKI/2 or CKI/4 (tcon[5]); BIO0 sources are not wired
+		// Timer source edges are sampled on CKI, even while the CPU waits.
 		tpre <= tpre + 1'd1;
+		tbio0 <= bioc[0] ? bio_out[0] : bio_in[0];
+		tpulse <= 1'b0;
 		// (9.3.2: an interrupt when the count reaches zero; at zero a one-shot
 		// count stops, a reloading one takes the initial count -- a period of
 		// N+1, every tick when N is 0)
-		if (tcon[0] && tcon[7:6] == 2'b00 && (tcon[5] ? (tpre == 2'd3) : tpre[0])) begin
+		if (tcon[0] && !(timer_write && !halted && !st_hold) &&
+		    ((tcon[7:5] == 3'b000 && tpre[0]) ||
+		    (tcon[7:5] == 3'b001 && tpre == 2'd3) ||
+		    (tcon[7:5] == 3'b100 && !tbio0 && (bioc[0] ? bio_out[0] : bio_in[0])) ||
+		    (tcon[7:5] == 3'b101 && tbio0 && !(bioc[0] ? bio_out[0] : bio_in[0])))) begin
 			if (tcount == 32'd0) begin
 				if (tcon[1]) begin
 					tcount <= tinit;
-					if (tinit == 32'd0) tmr_p <= 1'b1;
+					if (tinit == 32'd0) begin tmr_p <= 1'b1; tpulse <= 1'b1; ttoggle <= ~ttoggle; end
 				end
 			end
 			else begin
 				tcount <= tcount - 1'd1;
-				if (tcount == 32'd1) tmr_p <= 1'b1;
+				if (tcount == 32'd1) begin tmr_p <= 1'b1; tpulse <= 1'b1; ttoggle <= ~ttoggle; end
 			end
 		end
 	end
@@ -1737,6 +1932,10 @@ always @(posedge clk) begin
 		waiting  <= 1'b0;
 		lp_on    <= 1'b0;
 		lp_lock  <= 1'b0;
+		lp_block <= 1'b0; lp_cache <= 1'b0;
+		d_block <= 1'b0; o_block <= 1'b0; w_block <= 1'b0;
+		quad_lock <= 1'b0; quad_left <= 2'd0;
+		m_block <= 1'b0; m_block_first <= 1'b0;
 		irsh_v   <= 1'b0;
 		ir0_p    <= 1'b0;
 		ir1_p    <= 1'b0;
@@ -1746,10 +1945,19 @@ always @(posedge clk) begin
 		// pcw (Table 7-4): 0x038F; bits 10-13 latched from bio[7:4]
 		pcw      <= {2'b00, bio_in[4], bio_in[5], bio_in[6], bio_in[7], 10'h38F};
 		tcon     <= 8'd0;
+		tpre     <= 2'd0;
+		tbio0    <= 1'b0;
+		tpulse   <= 1'b0;
+		ttoggle  <= 1'b0;
 		tcount   <= 32'hFFFFFFFF;
 		tinit    <= 32'hFFFFFFFF;
 		ioc      <= 32'd0;
+		ibf      <= 1'b0;
+		obe      <= 1'b1;
 		dmacr    <= 8'd0;
+		dma_state <= 3'd0; dma_ticks <= 2'd0; dma_pair_output <= 1'b0;
+		ioffset <= 16'd0; ooffset <= 16'd0;
+		ifrm_p <= 1'b0; ofrm_p <= 1'b0;
 		bioc     <= 8'd0;
 		bio_q    <= 8'd0;
 		berr     <= 1'b0;
@@ -1761,9 +1969,48 @@ always @(posedge clk) begin
 		fpc      <= 32'd0;
 	end
 	else if (ce && !halted && !st_hold) begin
-		if (pend) begin
+		if (dma_start || (dma_active && dma_state == 3'd1)) begin
+			if (dma_start) begin
+				dma_input <= bs_we; dma_addr <= bs_ad; dma_size <= bs_sz; dma_data <= bs_wd;
+				dma_pair_output <= dma_want_input && dma_want_output;
+				dma_ticks <= 2'd0;
+				if (dma_want_input) ibf <= sio_rx_valid;
+			end
+			else if (dma_ticks != 2'd3) dma_ticks <= dma_ticks + 1'b1;
+			dma_type <= mtype(bs_ad, cmode);
+			if ((bs_sz == 2'd2 && bs_ad[1:0] != 2'd0) || (bs_sz == 2'd1 && bs_ad[0])) begin
+				aerr <= 1'b1; dma_state <= 3'd4; dma_pair_output <= 1'b0;
+				if (bs_we) dmacr[5] <= 1'b0; else dmacr[1] <= 1'b0;
+			end
+			else if (mtype(bs_ad, cmode) == MT_EXT) begin
+				m_addr <= bs_ad[31:2]; m_be <= be_of(bs_sz, bs_ad[1:0]);
+				m_we <= bs_we; m_wdata <= lanes(bs_sz, bs_wd);
+				m_block <= 1'b0; m_block_first <= 1'b0;
+				m_req <= ~m_req; dma_state <= 3'd2;
+			end
+			else begin
+				dma_q <= mtype(bs_ad, cmode) == MT_ROM ? dsp_rom(bs_ad[9:2]) : mmio_rd(bs_ad[9:2]);
+				if (mtype(bs_ad, cmode) == MT_MMIO) begin
+					if (bs_we) mmio_wr(bs_ad[9:2], be_of(bs_sz, bs_ad[1:0]), lanes(bs_sz, bs_wd));
+					else if (bs_ad[9:2] == 8'h01) ibf <= sio_rx_valid;
+				end
+				dma_state <= 3'd3;
+			end
+		end
+		else if (dma_active) begin
+			if (dma_ticks != 2'd3) dma_ticks <= dma_ticks + 1'b1;
+			case (dma_state)
+				3'd2: if (m_ack == m_req) dma_end(m_rdata, m_berr);
+				3'd3: dma_end(dma_type == MT_RAM ? ram_q : dma_q, 1'b0);
+				3'd4: if (dma_ticks >= 2'd2) dma_state <= 3'd0;
+				default: dma_state <= 3'd0;
+			endcase
+		end
+		else if (pend) begin
 			// an external access: done when the bus answers
 			if (m_ack == m_req) begin
+				if (m_block && quad_left == 2'd0) quad_lock <= 1'b0;
+				if (m_berr) begin quad_lock <= 1'b0; quad_left <= 2'd0; end
 				pend   <= 1'b0;
 				ext_q  <= m_rdata;
 				prev_t <= MT_EXT;
@@ -1784,22 +2031,30 @@ always @(posedge clk) begin
 			// alignment
 			if (go && ((sz == 2'd2 && ad[1:0] != 2'd0) || (sz == 2'd1 && ad[0]))) aerr <= 1'b1;
 			mt = mtype(ad, cmode);
-			if (go && mt == MT_EXT) begin
+			if (go && mt == MT_EXT && !cached_fetch) begin
 				m_addr  <= ad[31:2];
 				m_be    <= be_of(sz, ad[1:0]);
 				m_we    <= we;
 				m_wdata <= lanes(sz, wd);
 				m_req   <= ~m_req;
 				pend    <= 1'b1;
+				m_block <= ENABLE_DOBLOCK && (quad_lock || quad_begin);
+				m_block_first <= quad_begin;
+				if (ENABLE_DOBLOCK && quad_lock) quad_left <= quad_left - 1'b1;
+				else if (quad_begin) begin
+					quad_lock <= 1'b1; quad_left <= 2'd3;
+				end
 			end
 			else begin
-				if (go) begin
+				if (cached_fetch) begin prev_t <= MT_ROM; rom_q <= lp_word; end
+				else if (go) begin
 					prev_t <= mt;
 					case (mt)
 						MT_RAM:  ;                                  // (below)
 						MT_ROM:  rom_q  <= dsp_rom(ad[9:2]);
 						default: begin
 							mmio_q <= mmio_rd(ad[9:2]);
+							if (!we && ad[9:2] == 8'h01) ibf <= sio_rx_valid;
 							if (we) mmio_wr(ad[9:2], be_of(sz, ad[1:0]), lanes(sz, wd));
 						end
 					endcase
