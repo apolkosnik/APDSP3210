@@ -1,4 +1,4 @@
-# DSP3210
+# APDSP3210
 
 A synthesisable AT&T WE DSP3210 in SystemVerilog, written from the
 *WE DSP3210 Information Manual* (AT&T, September 1991) for the AA3000+
